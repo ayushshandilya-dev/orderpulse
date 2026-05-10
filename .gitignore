@@ -1,0 +1,47 @@
+# Binaries
+orderpulse-server
+orderpulse
+*.exe
+
+# Go build artifacts
+/vendor/
+coverage.out
+coverage
+
+# Submission data (local dev)
+/tmp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker build cache
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node & Frontend
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+dist-ssr/
+*.local
+
+# Generated Output
+graphify-out/
+
+# Local Assistant/Editor config
+.claude/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Temporary files
+_roadmap_tmp.md
+*.log
