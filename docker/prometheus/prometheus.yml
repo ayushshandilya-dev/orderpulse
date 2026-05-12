@@ -1,0 +1,84 @@
+# OrderPulse — Prometheus scrape configuration
+#
+# Topology (fully containerised via docker compose up -d):
+#   control-plane  — reachable at control-plane:8080 inside compose network
+#   cadvisor       — reachable at cadvisor:8080 inside compose network
+#   node-exporter  — reachable at node-exporter:9100 inside compose network
+#   redpanda       — reachable at redpanda:9644 inside compose network
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+  external_labels:
+    cluster: "orderpulse-local"
+
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
+scrape_configs:
+
+  # ── OrderPulse control plane ───────────────────────────────────────────────
+  # Runs inside compose network — use the service name directly.
+  - job_name: "orderpulse-server"
+    static_configs:
+      - targets: ["control-plane:8080"]
+        labels:
+          service: "control-plane"
+
+  # ── OrderPulse worker ──────────────────────────────────────────────────────
+  - job_name: "orderpulse-worker"
+    static_configs:
+      - targets: ["worker:9090"]
+        labels:
+          service: "worker"
+
+  # ── OrderPulse metrics consumer ────────────────────────────────────────────
+  - job_name: "orderpulse-consumer"
+    static_configs:
+      - targets: ["metrics-consumer:9090"]
+        labels:
+          service: "metrics-consumer"
+
+  # ── cAdvisor — per-container resource metrics ──────────────────────────────
+  # NO drop rules here — we want metrics for ALL containers so the admin
+  # dashboard container-health panels always have data.
+  # The submission_id relabelling still runs — it just leaves the label empty
+  # for platform containers, which is correct and queryable.
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          service: "cadvisor"
+    metric_relabel_configs:
+      # Promote orderpulse Docker labels to Prometheus labels.
+      # These are only set on sandbox containers — platform containers
+      # will have empty values, which is fine.
+      - source_labels: [container_label_orderpulse_submission_id]
+        target_label: submission_id
+      - source_labels: [container_label_orderpulse_language]
+        target_label: language
+      # Drop the cAdvisor container itself — its self-metrics are noise.
+      - source_labels: [name]
+        regex: ".*cadvisor.*"
+        action: drop
+      # Drop pause/POD containers (empty name = infrastructure bookkeeping).
+      - source_labels: [name]
+        regex: "^$"
+        action: drop
+
+  # ── Node exporter — host / WSL2 VM metrics ────────────────────────────────
+  # Runs inside compose network with port binding — reachable by service name.
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: "host"
+
+  # ── Redpanda — broker metrics ──────────────────────────────────────────────
+  - job_name: "redpanda"
+    static_configs:
+      - targets: ["redpanda:9644"]
+        labels:
+          service: "redpanda"
+    metrics_path: "/public_metrics"
