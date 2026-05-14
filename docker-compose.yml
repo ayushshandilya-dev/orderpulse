@@ -1,0 +1,324 @@
+version: "3.9"
+
+# OrderPulse — Local Development Stack
+#
+# Start everything:           docker compose up --build
+# Start infra only:           docker compose up redpanda timescaledb postgres loki prometheus cadvisor -d
+# Stop everything:            docker compose down -v
+
+services:
+
+  # ── Control Plane ────────────────────────────────────────────────────────────
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      SUBMISSION_DIR: "/data/submissions"
+      SANDBOX_IMAGE_GO:     "orderpulse-sandbox-go:latest"
+      SANDBOX_IMAGE_RUST:   "orderpulse-sandbox-rust:latest"
+      SANDBOX_IMAGE_CPP:    "orderpulse-sandbox-cpp:latest"
+      SANDBOX_IMAGE_PYTHON: "orderpulse-sandbox-python:latest"
+      SANDBOX_IMAGE_BINARY: "orderpulse-sandbox-binary:latest"
+      SANDBOX_CPU_QUOTA:    "100000"
+      SANDBOX_MEMORY_BYTES: "536870912"
+      SANDBOX_TIMEOUT:      "30m"
+      SANDBOX_NETWORK_MODE: "bridge"
+      SANDBOX_PORT_MIN:     "20000"
+      SANDBOX_PORT_MAX:     "21000"
+      MAX_UPLOAD_BYTES:     "268435456"
+      REDPANDA_BROKERS:     "redpanda:9092"
+      DISTRIBUTED_MODE:     "true"
+      ADMIN_API_KEY:        "testkey"
+      # Stage 5.9: PostgreSQL for durable contest storage.
+      # The control-plane uses PostgresContestStore in distributed mode when
+      # this DSN is set. MemoryContestStore is used as a fallback if unset.
+      POSTGRES_DSN: "postgres://orderpulse:orderpulse_dev@postgres:5432/orderpulse"
+    volumes:
+      - submissions_data:/data/submissions
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── PostgreSQL (Stage 5.9: contest store) ────────────────────────────────────
+  #
+  # Separate from TimescaleDB (which stores latency time-series metrics).
+  # This instance stores contest lifecycle data: contests, leaderboard snapshots.
+  #
+  # Why not reuse TimescaleDB?
+  #   TimescaleDB is owned by the metrics-consumer (different service boundary).
+  #   Contest data requires transactional guarantees (status transitions) that
+  #   TimescaleDB's hypertable model is not optimised for. Keeping them separate
+  #   also lets each be scaled/maintained independently.
+  #
+  # In production (GKE), this maps to k8s/postgres/statefulset.yaml.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       orderpulse
+      POSTGRES_USER:     orderpulse
+      POSTGRES_PASSWORD: orderpulse_dev
+    ports:
+      - "5433:5432"   # host:5433 to avoid collision with TimescaleDB on 5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderpulse -d orderpulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Redpanda ─────────────────────────────────────────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:v24.1.13
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--brokers", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  # ── Redpanda Console ──────────────────────────────────────────────────────────
+  console:
+    image: redpandadata/console:v2.6.0
+    environment:
+      CONFIG_FILEPATH: /etc/console/config.yaml
+    volumes:
+      - ./docker/console/config.yaml:/etc/console/config.yaml:ro
+    ports:
+      - "8088:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── TimescaleDB ───────────────────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:2.15.2-pg16
+    environment:
+      POSTGRES_DB: orderpulse
+      POSTGRES_USER: orderpulse
+      POSTGRES_PASSWORD: orderpulse_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "orderpulse", "-d", "orderpulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Metrics Consumer (Redpanda → TimescaleDB) ─────────────────────────────────
+  metrics-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    entrypoint: ["/app/consumer"]
+    environment:
+      REDPANDA_BROKERS:  "redpanda:9092"
+      CONSUMER_GROUP_ID: "orderpulse-consumer"
+      TIMESCALE_DSN:     "postgres://orderpulse:orderpulse_dev@timescaledb:5432/orderpulse"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Prometheus ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - cadvisor
+    restart: unless-stopped
+
+  # ── cAdvisor ──────────────────────────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+  # ── Node exporter ─────────────────────────────────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    command:
+      - --path.rootfs=/host
+    ports:
+      - "9100:9100"
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+
+  # ── Loki ──────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.0.0
+    command: -config.file=/etc/loki/loki.yml
+    volumes:
+      - ./docker/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Promtail ──────────────────────────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: -config.file=/etc/promtail/promtail.yml
+    volumes:
+      - ./docker/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED:  "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE:  "publicDashboards"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - timescaledb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── Benchmark Worker (Phase 3) ───────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    entrypoint: ["/app/worker"]
+    environment:
+      WORKER_ID: "worker-1"
+      ORCHESTRATOR_URL:     "http://control-plane:8080"
+      REDPANDA_BROKERS:     "redpanda:9092"
+      DISTRIBUTED_MODE:     "true"
+      POSTGRES_DSN:         "postgres://orderpulse:orderpulse_dev@postgres:5432/orderpulse"
+      SUBMISSION_DIR:       "/data/submissions"
+      JOB_TIMEOUT:          "35m"
+      SANDBOX_IMAGE_GO:     "orderpulse-sandbox-go:latest"
+      SANDBOX_IMAGE_RUST:   "orderpulse-sandbox-rust:latest"
+      SANDBOX_IMAGE_CPP:    "orderpulse-sandbox-cpp:latest"
+      SANDBOX_IMAGE_PYTHON: "orderpulse-sandbox-python:latest"
+      SANDBOX_IMAGE_BINARY: "orderpulse-sandbox-binary:latest"
+      SANDBOX_CPU_QUOTA:    "100000"
+      SANDBOX_MEMORY_BYTES: "536870912"
+      SANDBOX_TIMEOUT:      "30m"
+      SANDBOX_NETWORK_MODE: "bridge"
+      SANDBOX_PORT_MIN:     "21000"
+      SANDBOX_PORT_MAX:     "22000"
+      SANDBOX_HOST:         "host.docker.internal"
+      BOT_COUNT:              "100"
+      BOT_TEST_DURATION:      "60s"
+      BOT_RAMP_UP_DURATION:   "5s"
+      BOT_ORDER_RATIO_LIMIT:  "0.60"
+      BOT_ORDER_RATIO_MARKET: "0.30"
+      BOT_ORDER_RATIO_CANCEL: "0.10"
+      BOT_PER_REQUEST_TIMEOUT: "2s"
+    volumes:
+      - submissions_data:/data/submissions
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  submissions_data:
+  redpanda_data:
+  timescale_data:
+  postgres_data:
+  prometheus_data:
+  loki_data:
+  grafana_data:
