@@ -1,0 +1,22 @@
+# sandbox/Dockerfile.cpp
+# ~250 MB — GCC + CMake on a slim base.
+
+FROM ubuntu:24.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar gzip \
+    g++ gcc cmake make pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN (userdel -r ubuntu || true) && \
+    groupadd -g 1000 runner && \
+    useradd -u 1000 -g runner -m -s /bin/bash runner && \
+    mkdir -p /app /submission /orderpulse && \
+    chown runner:runner /app /orderpulse /home/runner
+
+COPY entrypoint.sh /orderpulse/entrypoint.sh
+RUN chmod +x /orderpulse/entrypoint.sh
+
+EXPOSE 7878
+WORKDIR /app
+ENTRYPOINT ["/orderpulse/entrypoint.sh"]
