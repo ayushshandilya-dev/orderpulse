@@ -171,7 +171,7 @@ func (v *Validator) runConcurrentScenario(ctx context.Context, sc *scenario) (Sc
 			if r.idx == i {
 				found = true
 				if r.err != nil && (errors.Is(r.err, context.DeadlineExceeded) ||
-				errors.Is(r.err, context.Canceled)) {
+					errors.Is(r.err, context.Canceled)) {
 					timedOutIDs = append(timedOutIDs, order.ID)
 				}
 				break
